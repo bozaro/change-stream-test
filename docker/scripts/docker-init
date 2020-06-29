@@ -1,0 +1,74 @@
+#!/bin/bash -e
+
+hostip=`hostname -I | awk '{print $1}'`
+function wait_port {
+  echo Wait for service on port: $1 $hostip
+  n=0
+  until nc -z $hostip $1; do
+    sleep 0.1
+    n=$((n + 1))
+    if [ "$n" -gt 300 ]; then
+      echo Waiting port $1 timeout
+      exit 1
+    fi
+  done
+}
+
+# Prepare supervisor directory (for tmpfs)
+sudo mkdir -p /var/opt/log/supervisor
+
+# Prepare mongo directory (for tmpfs)
+sudo mkdir -p /var/db/mongo/conf /var/opt/log/mongo
+sudo chown mongodb:mongodb -R /var/db/mongo /var/opt/log/mongo
+
+ports=()
+if [ -z "$mongo_cache_gb" ]; then
+  mongo_cache_gb=0.5
+fi
+(
+  cat /etc/mongod.conf
+  cat <<EOF
+storage:
+   wiredTiger:
+      engineConfig:
+         cacheSizeGB: $mongo_cache_gb
+replication:
+   oplogSizeMB: 32
+EOF
+) | sudo tee /etc/mongod-custom.conf > /dev/null
+
+if [ -z "$mongo_shards" ]; then
+  mongo_shards=1
+fi
+
+# Update `numprocs` in mongo services
+sudo sed -i -r "s/(numprocs=)[0-9]+/\\1$mongo_shards/g" /etc/supervisor/conf.d/mongo-rs.conf
+
+# Prepare mongo directory (for tmpfs)
+for i in $(seq 1 $mongo_shards); do
+  sudo mkdir -p /var/db/mongo/rs$(($i - 1))
+done
+sudo chown mongodb:mongodb -R /var/db/mongo
+
+# Start services
+echo Start services...
+sudo /usr/bin/supervisord --configuration /etc/supervisor/supervisord.conf
+
+# Wait mongod conf replica set
+wait_port 28000
+
+mongo localhost:28000 --eval "rs.initiate({_id: 'conf', version: 1, members: [{_id: 0, host: '127.0.0.1:28000' }]}); while (!db.isMaster().ismaster) {sleep(100);}" > /dev/null
+
+# Wait for mongos port listen
+wait_port 27017
+wait_port 27018
+wait_port 27019
+
+# Ininialize mongo replica sets
+echo Ininialize mongo replica sets
+wait_port 29000
+mongo localhost:29000 --eval "rs.initiate({_id: 'rs0', version: 1, members: [{_id: 0, host: '127.0.0.1:29000' }]}); while (!db.isMaster().ismaster) {sleep(100);}" > /dev/null
+mongo localhost:27017 --eval "sh.addShard('rs0/127.0.0.1:29000')" > /dev/null
+
+echo Mongo is ready
+exec "$@"
